@@ -43,7 +43,7 @@ WITH_GUI = False
 NON_INTERACTIVE = True 
 
 SIDE = "both"  
-ALIGNMENT_TYPE = "procrustesalign" 
+ALIGNMENT_TYPE = "SPHARM_procalign" 
 
 # ===============================================================================
 # EXTERNAL TOOLS
@@ -61,9 +61,10 @@ def get_slicersalt_module_path(module_name: str, slicer_version_specific_path_pa
         raise ValueError(f"Unknown SlicerSALT module type: {module_type}")
 
 SPHARM_PDM_PYTHON_SCRIPT_PATH = get_slicersalt_module_path("SPHARM-PDM", "SlicerSALT-5.3", "CommandLineTool")
-# MFSDA_RUN_PATH = get_slicersalt_module_path("MFSDA_run", "SlicerSALT-5.1", "qt-scripted-modules") 
-# MFSDA_CREATE_SHAPES_PATH = get_slicersalt_module_path("MFSDA_createShapes", "SlicerSALT-5.1", "qt-scripted-modules")
+MFSDA_RUN_PATH = get_slicersalt_module_path("MFSDA_run", "SlicerSALT-5.3", "qt-scripted-modules") 
+MFSDA_CREATE_SHAPES_PATH = get_slicersalt_module_path("MFSDA_createShapes", "SlicerSALT-5.3", "qt-scripted-modules")
 
+print(MFSDA_RUN_PATH)
 
 # ===============================================================================
 # DIRECTORY STRUCTURE

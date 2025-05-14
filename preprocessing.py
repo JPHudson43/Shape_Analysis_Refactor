@@ -8,13 +8,11 @@ import os
 import glob
 import shutil
 import subprocess
-# import tkinter as tk # Tkinter is no longer used
-# from tkinter import filedialog, messagebox # Tkinter is no longer used
 import logging
 import sys
 from typing import Dict, List, Optional, Union, Tuple
 
-import config
+import config # Imports config_module_v9_template_fix (or your latest config)
 from utils import run_command, get_file_paths_by_pattern, normalize_path_for_platform, print_section_header
 
 # Configure logging
@@ -25,52 +23,57 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def segment_hippocampus(input_dir_param: Optional[str] = None, 
-                        output_dir_param: Optional[str] = None, 
+                        output_dir_param: Optional[str] = None, # This param defines the root for segmentation outputs
                         hippodeep_path_param: Optional[str] = None) -> Dict[str, str]:
     """
     Segment the hippocampus from T1-weighted MRI images using hippodeep_pytorch.
-    Input directory is taken from config.T1_INPUT_DIR by default but can be overridden.
+    Input directory for T1s is taken from config.T1_IMAGES_DIR_ROOT_FOR_SPHARM_INPUT by default if input_dir_param is None.
+    The main output directory for segmentation (where masks_L, masks_R etc. subfolders are created)
+    is taken from config.SEG_OUTPUT_ROOT_DIR by default if output_dir_param is None.
     
     Parameters:
     -----------
     input_dir_param : str, optional
-        Directory containing T1-weighted MRI images in .nii or .nii.gz format.
-        If None, config.T1_INPUT_DIR will be used.
+        Directory containing T1-weighted MRI images.
+        Defaults to config.T1_IMAGES_DIR_ROOT_FOR_SPHARM_INPUT.
     output_dir_param : str, optional
-        Directory where segmentation results will be saved.
-        If None, config.SEG_OUTPUT_ROOT_DIR will be used.
+        Root directory where segmentation subdirectories (masks_L, masks_R, etc.) will be created.
+        Defaults to config.SEG_OUTPUT_ROOT_DIR.
     hippodeep_path_param : str, optional
         Path to the hippodeep_pytorch deepseg1.sh script.
-        If None, config.HIPPODEEP_PATH will be used.
+        Defaults to config.HIPPODEEP_PATH.
     
     Returns:
     --------
     dict
-        Dictionary of output directories, or empty dict on failure.
+        Dictionary of absolute paths to the created output subdirectories, or empty dict on failure.
     """
     hippodeep_path = hippodeep_path_param or config.HIPPODEEP_PATH
-    output_dir = output_dir_param or config.SEG_OUTPUT_ROOT_DIR 
-    input_dir = input_dir_param or config.T1_INPUT_DIR 
+    # This is the root directory where Hippodeep's outputs will be organized into subfolders.
+    segmentation_root_output_dir = output_dir_param or config.SEG_OUTPUT_ROOT_DIR 
+    
+    # This is the directory containing the raw T1 images to be processed.
+    t1_input_dir = input_dir_param or config.T1_IMAGES_DIR_ROOT_FOR_SPHARM_INPUT 
 
     print_section_header("HIPPOCAMPAL SEGMENTATION")
     
-    if not input_dir:
-        logger.error("Input directory for T1 images is not specified in arguments or config.T1_INPUT_DIR.")
+    if not t1_input_dir: 
+        logger.error("Input directory for T1 images is not specified in arguments or config.")
         return {}
-    if not os.path.isdir(input_dir):
-        logger.error(f"Specified input directory does not exist: {input_dir}")
+    if not os.path.isdir(t1_input_dir):
+        logger.error(f"Specified T1 input directory does not exist: {t1_input_dir}")
         return {}
         
-    logger.info(f"Using input directory for T1 images: {input_dir}")
+    logger.info(f"Using input directory for T1 images: {t1_input_dir}")
 
-    t1_nii_files = get_file_paths_by_pattern(input_dir, "*.nii") + \
-                   get_file_paths_by_pattern(input_dir, "*.nii.gz")
+    t1_nii_files = get_file_paths_by_pattern(t1_input_dir, "*.nii") + \
+                   get_file_paths_by_pattern(t1_input_dir, "*.nii.gz")
     
     if not t1_nii_files:
-        logger.error(f"No .nii or .nii.gz files found in {input_dir}. Exiting...")
+        logger.error(f"No .nii or .nii.gz files found in {t1_input_dir}. Exiting...")
         return {}
     
-    logger.info(f"Found the following T1 MRI files in {input_dir} to process:")
+    logger.info(f"Found the following T1 MRI files in {t1_input_dir} to process:")
     normalized_t1_file_paths = []
     for nii_file_path in t1_nii_files:
         normalized_path = normalize_path_for_platform(nii_file_path)
@@ -79,7 +82,9 @@ def segment_hippocampus(input_dir_param: Optional[str] = None,
     
     logger.info("Proceeding with the hippodeep_pytorch segmentation. This may take a while...")
     
-    output_subdirs = {
+    # Define the specific output subdirectories using variables from config.py
+    # These variables in config.py should already be full paths.
+    output_subdirs_absolute = {
         "left_masks": config.SEG_LEFT_MASKS_DIR, 
         "right_masks": config.SEG_RIGHT_MASKS_DIR,
         "cerebrum_masks": config.SEG_CEREBRUM_MASKS_DIR,
@@ -87,24 +92,23 @@ def segment_hippocampus(input_dir_param: Optional[str] = None,
         "volume_reports": config.SEG_VOLUME_REPORTS_DIR
     }
     
-    for subdir_name, subdir_path in output_subdirs.items():
+    # Ensure all these specific output directories (defined in config.py) exist
+    for subdir_name, subdir_path in output_subdirs_absolute.items():
         try:
             os.makedirs(subdir_path, exist_ok=True)
-            logger.info(f"Ensured directory exists: {subdir_path}")
+            logger.info(f"Ensured output subdirectory exists: {subdir_path}")
         except OSError as e:
-            logger.error(f"Could not create directory {subdir_path}: {e}")
+            logger.error(f"Could not create output subdirectory {subdir_path}: {e}")
             return {} 
             
     try:
         if not os.access(hippodeep_path, os.X_OK):
             logger.warning(f"Hippodeep script at {hippodeep_path} may not be executable. Attempting to run with 'bash'.")
 
-        # Construct the command to pass individual files to deepseg1.sh
-        # The deepseg1.sh script should be able to handle multiple file paths as arguments.
         hippodeep_command_list = ["bash", hippodeep_path] + normalized_t1_file_paths
         
         logger.info(f"Preparing to run hippodeep command with {len(normalized_t1_file_paths)} file(s).")
-        logger.debug(f"Full command: {' '.join(hippodeep_command_list)}") # Log full command for debugging
+        logger.debug(f"Full command: {' '.join(hippodeep_command_list)}") 
         
         result = run_command(
             hippodeep_command_list, 
@@ -132,52 +136,45 @@ def segment_hippocampus(input_dir_param: Optional[str] = None,
         logger.error(f"An unexpected error occurred while running the hippodeep script: {str(e)}")
         return {}
         
-    # Hippodeep typically outputs files into the same directory as the input T1s,
-    # or into a subdirectory named after the input file.
-    # We will search for output masks in the original input_dir.
-    move_hippodeep_files(source_dir=input_dir, target_output_subdirs=output_subdirs) 
+    # After hippodeep runs, it's assumed to output files into the t1_input_dir (or subdirs named after T1s).
+    # move_hippodeep_files will sort these into the respective target_output_subdirs.
+    move_hippodeep_files(source_dir=t1_input_dir, target_output_subdirs=output_subdirs_absolute) 
     
     print_section_header("SEGMENTATION COMPLETE")
     logger.info("The segmentation process is complete and all files have been placed into their respective folders.")
     
-    return output_subdirs
+    return output_subdirs_absolute # Return the dictionary of absolute paths
 
 def move_hippodeep_files(source_dir: str, target_output_subdirs: Dict[str, str]) -> None:
     """
     Move hippodeep output files from a source directory to their respective target subdirectories.
-    
-    Parameters:
-    -----------
-    source_dir : str
-        Directory where hippodeep generated the output files (e.g., the T1 input directory).
-    target_output_subdirs : dict
-        Dictionary with keys like 'left_masks' and values as absolute paths to target directories
-        (e.g., config.SEG_LEFT_MASKS_DIR).
     """
     patterns = {
-        "left_masks": "*mask_L.nii.gz", # Hippodeep output pattern for left mask
-        "right_masks": "*mask_R.nii.gz",# Hippodeep output pattern for right mask
+        "left_masks": "*mask_L.nii.gz", 
+        "right_masks": "*mask_R.nii.gz",
         "cerebrum_masks": "*cerebrum_mask.nii.gz", 
         "brain_masks": "*brain_mask.nii.gz",       
-        "volume_reports": "*.csv" # Hippodeep output pattern for volume reports
-        # Add other patterns if hippodeep generates more file types to be moved
+        "volume_reports": "*.csv"                  
     }
     
     logger.info(f"Attempting to move hippodeep output files from source: {source_dir}")
 
-    # Also check for files in subdirectories named after the input files, as some tools do this.
-    # Example: if input is source_dir/subjectA.nii, output might be source_dir/subjectA/subjectA_mask_L.nii.gz
     potential_source_dirs = [source_dir]
-    for item in os.listdir(source_dir):
-        item_path = os.path.join(source_dir, item)
-        if os.path.isdir(item_path):
-            potential_source_dirs.append(item_path)
+    # Check for subdirectories named after input files, as some tools output there
+    if os.path.isdir(source_dir): # Ensure source_dir itself is valid
+        for item in os.listdir(source_dir): 
+            item_path = os.path.join(source_dir, item)
+            if os.path.isdir(item_path):
+                potential_source_dirs.append(item_path)
+    else:
+        logger.error(f"Source directory for moving files does not exist or is not a directory: {source_dir}")
+        return # Cannot proceed if source_dir is invalid
     
     logger.info(f"Searching for output files in: {potential_source_dirs}")
 
     for dir_key, pattern in patterns.items():
         if dir_key in target_output_subdirs:
-            target_dir_path = target_output_subdirs[dir_key] 
+            target_dir_path = target_output_subdirs[dir_key] # This is the absolute target path
             
             files_found_for_pattern = []
             for s_dir in potential_source_dirs:
@@ -192,9 +189,9 @@ def move_hippodeep_files(source_dir: str, target_output_subdirs: Dict[str, str])
             for file_path in files_found_for_pattern:
                 try:
                     file_name = os.path.basename(file_path)
-                    if not os.path.exists(target_dir_path):
+                    if not os.path.exists(target_dir_path): # Should have been created by segment_hippocampus
                         logger.warning(f"Target directory {target_dir_path} does not exist. Attempting to create.")
-                        os.makedirs(target_dir_path, exist_ok=True)
+                        os.makedirs(target_dir_path, exist_ok=True) 
 
                     final_target_path = os.path.join(target_dir_path, file_name)
                     
@@ -217,6 +214,7 @@ def binarize_masks(left_masks_dir_param: Optional[str] = None,
     """
     Binarize hippocampal segmentation masks using FSL's fslmaths.
     """
+    # These now correctly use the specific config variables for segmentation outputs as inputs
     left_masks_dir = left_masks_dir_param or config.SEG_LEFT_MASKS_DIR
     right_masks_dir = right_masks_dir_param or config.SEG_RIGHT_MASKS_DIR
     left_output_dir = left_output_dir_param or config.BINARIZED_LEFT_MASKS_DIR
@@ -335,8 +333,8 @@ def register_masks(left_masks_dir_param: Optional[str] = None,
     right_masks_dir = right_masks_dir_param or config.BINARIZED_RIGHT_MASKS_DIR
     left_output_dir = left_output_dir_param or config.REGISTERED_LEFT_MASKS_DIR
     right_output_dir = right_output_dir_param or config.REGISTERED_RIGHT_MASKS_DIR
-    left_reference = left_reference_param or config.LEFT_REFERENCE_IMAGE
-    right_reference = right_reference_param or config.RIGHT_REFERENCE_IMAGE
+    left_reference = left_reference_param or config.LEFT_REFERENCE_IMAGE_FLIRT
+    right_reference = right_reference_param or config.RIGHT_REFERENCE_IMAGE_FLIRT
     flirt_options_str = flirt_options_param or config.FLIRT_OPTIONS 
     
     print_section_header("MASK REGISTRATION")
@@ -369,10 +367,10 @@ def register_masks(left_masks_dir_param: Optional[str] = None,
         return False
         
     if not os.path.exists(left_reference):
-        logger.error(f"Left reference image not found: {left_reference}")
+        logger.error(f"Left reference image for FLIRT not found: {left_reference}")
         return False
     if not os.path.exists(right_reference):
-        logger.error(f"Right reference image not found: {right_reference}")
+        logger.error(f"Right reference image for FLIRT not found: {right_reference}")
         return False
         
     left_masks = get_file_paths_by_pattern(left_masks_dir, "*.nii.gz")

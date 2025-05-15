@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 BASE_DIR = "/home/jeremy/Desktop/hippo_morph"
 MAX_WORKERS = 4 
 SPHARM_TIMEOUT_SECONDS = 3600 * 4 # Example: 4 hours. Adjust as needed.
+MFSDA_TIMEOUT_SECONDS = 120 
 FAIL_PIPELINE_ON_EMPTY_INPUT_MASKS = False
 ROI_NAME = "hippo" # Still used for ROI-specific subdirectories in SPHARM output and potentially other logic
 

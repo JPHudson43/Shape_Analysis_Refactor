@@ -1,7 +1,8 @@
 """
 Statistics Module
 ---------------
-Handles statistical analysis for static and longitudinal data.
+Handles statistical analysis for static and longitudinal data using SlicerSALT modules.
+Monitors SlicerSALT output for completion phrases to manage process termination.
 """
 
 import os
@@ -11,731 +12,575 @@ import tempfile
 import logging
 import json
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Dict, Optional, List, Union, Tuple
+import time # For Popen monitoring loop
+from typing import Dict, Optional, List, Union
 
-import config # Ensures MFSDA_TIMEOUT_SECONDS can be accessed
-from utils import run_command, print_section_header 
+# Attempt to import project-specific configuration.
+try:
+    import config
+except ImportError:
+    logging.basicConfig(level=logging.ERROR)
+    logger = logging.getLogger(__name__)
+    logger.error("CRITICAL: config.py not found. This script relies on it for paths and settings.")
+    class DummyConfig: # Fallback for parsing if config is missing
+        SLICERSALT_PATH = "/path/to/SlicerSALT"
+        MFSDA_RUN_PATH = "/path/to/MFSDA_run.py"
+        MFSDA_CREATE_SHAPES_PATH = "/path/to/MFSDA_createShapes.py"
+        MFSDA_TIMEOUT_SECONDS = 7200
+        SPHARM_TIMEOUT_SECONDS = 7200
+        MFSDA_RUN_COMPLETION_PHRASE = "The total elapsed time is"
+        MFSDA_CREATESHAPES_COMPLETION_PHRASE = None # Or a specific phrase if known
+        def get_paths_by_side(self, side, component): return f"/dummy/path/{side}/{component}"
+    config = DummyConfig()
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Assuming utils.py is in the same directory or PYTHONPATH
+try:
+    from utils import run_command, print_section_header # run_command might still be used for other things
+except ImportError:
+    logger = logging.getLogger(__name__)
+    logger.error("CRITICAL: utils.py not found.")
+    def print_section_header(title): logger.info(title)
+    # Define a dummy run_command if not available, though Popen will be primary here
+    def run_command(command, description="", check=True, timeout=None, cwd=None):
+        logger.error(f"Dummy run_command called for: {command}. utils.py is missing.")
+        return subprocess.CompletedProcess(command, 1, "Dummy STDOUT", "Dummy STDERR: utils.py missing")
+
+
+if not logging.getLogger().hasHandlers():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
 logger = logging.getLogger(__name__)
 
-def run_static_analysis(side: str = "left") -> bool:
+
+def _run_slicersalt_module_monitor_output(
+    command_list: List[str],
+    completion_phrase: Optional[str],
+    timeout_seconds: int,
+    description: str = ""
+) -> bool:
     """
-    Run static statistical analysis on SPHARM models.
-    
-    Parameters:
-    -----------
-    side : str
-        Hemisphere to process ("left" or "right").
-        
+    Runs a SlicerSALT module using subprocess.Popen, monitors its stdout for a
+    completion phrase, and terminates the process.
+
+    Args:
+        command_list: The command and arguments to execute.
+        completion_phrase: The string to look for in stdout to indicate success.
+                           If None, relies on process exit or timeout.
+        timeout_seconds: Maximum time to wait for the process.
+        description: A description of the task for logging.
+
     Returns:
-    --------
-    bool
-        True if analysis was successful, False otherwise
+        True if the completion phrase is found (or process exits with 0 if no phrase),
+        False on timeout or error.
     """
-    print_section_header(f"STATIC STATISTICAL ANALYSIS: {side.upper()} HEMISPHERE")
-    
-    try:
-        # This is the original CSV with SubjectPath, SubjectID, Covariates...
-        original_csv_path = config.get_paths_by_side(side, "static_csv")
-        output_dir = config.get_paths_by_side(side, "stats_static_output") 
-        shape_template = config.get_paths_by_side(side, "sphere_template") 
-        sphere_template_for_mfsda = config.get_paths_by_side(side, "sphere_template")
-    except ValueError as e:
-        logger.error(f"Configuration error getting paths for static analysis (side: {side}): {e}")
-        return False
-    except AttributeError as e: 
-        logger.error(f"Configuration error: {e}. A required path variable might be missing in config.py.")
-        return False
+    if description:
+        logger.info(description)
+    logger.info(f"Executing (with Popen monitoring): {' '.join(command_list)}")
+    if completion_phrase:
+        logger.info(f"Watching for completion phrase: '{completion_phrase}'")
+    logger.info(f"Timeout set to: {timeout_seconds} seconds.")
 
+    process = None
     try:
-        os.makedirs(output_dir, exist_ok=True)
-        logger.info(f"Ensured output directory for static stats exists: {output_dir}")
-    except OSError as e:
-        logger.error(f"Could not create output directory {output_dir}: {e}")
-        return False
+        process = subprocess.Popen(
+            command_list,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, # Redirect stderr to stdout
+            text=True,
+            bufsize=1,  # Line buffered
+            universal_newlines=True
+        )
+
+        start_time = time.time()
+        log_buffer = [] # To store recent lines for context on error
+
+        while True:
+            # Check for timeout
+            if (time.time() - start_time) > timeout_seconds:
+                logger.error(f"Timeout: Process exceeded {timeout_seconds} seconds for: {description}")
+                process.terminate()
+                try:
+                    process.wait(timeout=5) # Wait a bit for terminate
+                except subprocess.TimeoutExpired:
+                    logger.warning("Process did not terminate gracefully after timeout, killing.")
+                    process.kill()
+                return False
+
+            # Read output line
+            if process.stdout:
+                output_line = process.stdout.readline()
+                if output_line:
+                    line_stripped = output_line.strip()
+                    if line_stripped:
+                        logger.info(f"[SlicerSALT_LOG] {line_stripped}")
+                        log_buffer.append(line_stripped)
+                        if len(log_buffer) > 50: # Keep last 50 lines
+                            log_buffer.pop(0)
+                    
+                    if completion_phrase and completion_phrase in output_line:
+                        logger.info(f"Completion phrase '{completion_phrase}' detected for: {description}")
+                        process.terminate()
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            logger.warning(f"Process for '{description}' did not terminate gracefully after phrase, killing.")
+                            process.kill()
+                        return True
+                elif process.poll() is not None: # Process has exited
+                    break # Exit while loop
+            else: # Should not happen if stdout is piped
+                time.sleep(0.1)
+
+
+            # Check if process has exited (after attempting to read line)
+            if process.poll() is not None:
+                break
+            
+            time.sleep(0.05) # Small sleep to prevent busy-waiting
+
+        # Process has exited, check return code
+        return_code = process.returncode
+        logger.info(f"SlicerSALT process for '{description}' exited with code: {return_code}")
         
-    if not os.path.exists(original_csv_path):
-        logger.error(f"Static analysis CSV file not found: {original_csv_path}. This file should contain SubjectPath and covariates.")
+        if completion_phrase: 
+            logger.warning(f"Process for '{description}' exited before completion phrase was found. Return code: {return_code}")
+            return False 
+        else: 
+            return return_code == 0
+
+    except FileNotFoundError:
+        logger.error(f"SlicerSALT executable or script not found. Command: {' '.join(command_list)}")
         return False
-    
-    logger.info(f"Running static statistical analysis using base CSV: {original_csv_path}")
-    
+    except Exception as e:
+        logger.error(f"An unexpected error occurred running SlicerSALT module '{description}': {e}")
+        logger.exception("Detailed traceback:")
+        if process and process.poll() is None:
+            logger.warning(f"Terminating SlicerSALT process for '{description}' due to exception.")
+            process.kill()
+        return False
+    finally:
+        if process and process.poll() is None:
+            logger.warning(f"Ensuring SlicerSALT process for '{description}' is terminated (reached finally block while running).")
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+
+def _prepare_mfsda_dataframe(original_csv_path: str, expected_path_column: str) -> Optional[pd.DataFrame]:
+    """
+    Reads the CSV intended for MFSDA.
+    It expects the first column to be the path to shape data (as per expected_path_column),
+    and all subsequent columns to be numerical covariates.
+    It will attempt to convert these subsequent columns to numeric and drop any that fail.
+    """
     try:
         df_original = pd.read_csv(original_csv_path)
         if df_original.empty:
-            logger.error(f"Static analysis CSV file {original_csv_path} is empty. Cannot proceed.")
-            return False
-        if "SubjectPath" not in df_original.columns or df_original.columns[0] != "SubjectPath": 
-            logger.error(f"Static analysis CSV file {original_csv_path} must contain 'SubjectPath' as the first column.")
-            return False
+            logger.error(f"Input CSV file {original_csv_path} is empty.")
+            return None
         
-        # Determine columns for MFSDA (numerical covariates after SubjectPath and SubjectID)
-        if "SubjectID" not in df_original.columns or df_original.columns[1] != "SubjectID":
-            logger.warning(f"Static analysis CSV file {original_csv_path} does not have 'SubjectID' as the second column. Assuming numerical covariates start from the second column.")
-            cols_for_mfsda_data = list(df_original.columns[1:])
-        else:
-            subject_id_col_index = df_original.columns.get_loc('SubjectID')
-            cols_for_mfsda_data = list(df_original.columns[subject_id_col_index + 1:])
+        if expected_path_column not in df_original.columns or df_original.columns[0] != expected_path_column:
+            logger.error(f"Input CSV {original_csv_path} must contain '{expected_path_column}' as its first column.")
+            return None
 
-        df_for_mfsda = df_original[['SubjectPath'] + cols_for_mfsda_data]
+        # All columns after the first (path) column are considered potential numerical covariates.
+        potential_covariate_cols = list(df_original.columns[1:])
+        logger.info(f"Using '{expected_path_column}' as path column from {original_csv_path}. "
+                    f"Attempting to use subsequent columns as numerical covariates: {potential_covariate_cols}")
+
+        # Create a copy to modify, starting with the path column
+        df_for_mfsda = df_original[[expected_path_column]].copy()
         
-    except Exception as e:
-        logger.error(f"Error reading or preparing data from static analysis CSV {original_csv_path}: {str(e)}")
-        return False
-
-    mfsda_run_path = getattr(config, "MFSDA_RUN_PATH", None)
-    mfsda_createshapes_path = getattr(config, "MFSDA_CREATE_SHAPES_PATH", None)
-
-    if not mfsda_run_path or not mfsda_createshapes_path:
-        logger.error("MFSDA_RUN_PATH or MFSDA_CREATE_SHAPES_PATH not defined in config.py. Cannot run MFSDA.")
-        return False
-    if not os.path.exists(mfsda_run_path):
-        logger.error(f"MFSDA_run.py script not found at: {mfsda_run_path}")
-        return False
-    if not os.path.exists(mfsda_createshapes_path):
-        logger.error(f"MFSDA_createShapes.py script not found at: {mfsda_createshapes_path}")
-        return False
-
-    temp_csv_for_mfsda_fd = -1 
-    temp_csv_for_mfsda_path = ""
-    success = False
-    try:
-        temp_csv_for_mfsda_fd, temp_csv_for_mfsda_path = tempfile.mkstemp(suffix='.csv', prefix='mfsda_static_input_')
-        logger.info(f"Creating temporary MFSDA-compatible CSV for static analysis: {temp_csv_for_mfsda_path}")
-        df_for_mfsda.to_csv(temp_csv_for_mfsda_path, index=False)
-
-        success = run_mfsda_subprocess( 
-            csv_path_for_mfsda=temp_csv_for_mfsda_path, 
-            output_dir=output_dir,
-            shape_template=shape_template, 
-            sphere_template_for_mfsda=sphere_template_for_mfsda, 
-            mfsda_run_path=mfsda_run_path,
-            mfsda_createshapes_path=mfsda_createshapes_path,
-            slicersalt_path=config.SLICERSALT_PATH
-        )
-    except Exception as e_outer:
-        logger.error(f"Outer error during static MFSDA setup or execution: {e_outer}")
-        success = False
-    finally:
-        if temp_csv_for_mfsda_fd != -1:
+        actual_numerical_covariate_cols = []
+        for col in potential_covariate_cols:
             try:
-                os.close(temp_csv_for_mfsda_fd)
-            except OSError as e:
-                logger.warning(f"Error closing temp file descriptor for {temp_csv_for_mfsda_path}: {e}")
-        if temp_csv_for_mfsda_path and os.path.exists(temp_csv_for_mfsda_path):
-            try:
-                os.remove(temp_csv_for_mfsda_path)
-                logger.info(f"Removed temporary MFSDA CSV: {temp_csv_for_mfsda_path}")
-            except OSError as e:
-                 logger.warning(f"Error removing temp file {temp_csv_for_mfsda_path}: {e}")
-
-    if success:
-        logger.info(f"Static statistical analysis completed for {side} hemisphere. Results saved to {output_dir}")
-    else:
-        logger.error(f"Static statistical analysis failed for {side} hemisphere. Check logs for details.")
-    
-    return success
-
-def run_longitudinal_analysis(side: str = "left") -> bool:
-    """
-    Run longitudinal statistical analysis on delta models.
-    """
-    print_section_header(f"LONGITUDINAL STATISTICAL ANALYSIS: {side.upper()} HEMISPHERE")
-    
-    try:
-        original_csv_path = config.get_paths_by_side(side, "longit_stats_csv")
-        output_dir = config.get_paths_by_side(side, "stats_longit_output")
-        shape_template = config.get_paths_by_side(side, "sphere_template") 
-        sphere_template_for_mfsda = config.get_paths_by_side(side, "sphere_template")
-    except ValueError as e:
-        logger.error(f"Configuration error getting paths for longitudinal analysis (side: {side}): {e}")
-        return False
-    except AttributeError as e:
-        logger.error(f"Configuration error: {e}. A required path variable might be missing in config.py.")
-        return False
-
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-        logger.info(f"Ensured output directory for longitudinal stats exists: {output_dir}")
-    except OSError as e:
-        logger.error(f"Could not create output directory {output_dir}: {e}")
-        return False
+                # Attempt to convert the column to numeric
+                numeric_col = pd.to_numeric(df_original[col])
+                # If successful, add it to our DataFrame for MFSDA
+                df_for_mfsda[col] = numeric_col
+                actual_numerical_covariate_cols.append(col)
+            except ValueError:
+                logger.warning(f"Column '{col}' in {original_csv_path} could not be converted to numeric and will be excluded from MFSDA covariates.")
         
-    if not os.path.exists(original_csv_path):
-        logger.error(f"Longitudinal statistics CSV file not found: {original_csv_path}.")
-        return False
-    
-    logger.info(f"Running longitudinal statistical analysis using base CSV: {original_csv_path}")
-    
-    try:
-        df_original = pd.read_csv(original_csv_path)
-        if df_original.empty:
-            logger.error(f"Longitudinal statistics CSV file {original_csv_path} is empty.")
-            return False
-        
-        path_column_name = "DeltaModelPath" # Expected first column for longitudinal MFSDA
-        if path_column_name not in df_original.columns or df_original.columns[0] != path_column_name: 
-            logger.error(f"Longitudinal statistics CSV {original_csv_path} must have '{path_column_name}' as its first column for MFSDA.")
-            return False
-        
-        if "SubjectID" not in df_original.columns or df_original.columns[1] != "SubjectID":
-            logger.warning(f"Longitudinal CSV {original_csv_path} does not have 'SubjectID' as the second column. Assuming numerical covariates start after '{path_column_name}'.")
-            cols_for_mfsda_data = list(df_original.columns[1:])
-        else:
-            subject_id_col_index = df_original.columns.get_loc('SubjectID')
-            cols_for_mfsda_data = list(df_original.columns[subject_id_col_index + 1:])
-        
-        df_for_mfsda = df_original[[path_column_name] + cols_for_mfsda_data]
+        if not actual_numerical_covariate_cols: # Check if any numerical covariates were successfully processed
+            logger.error(f"After processing, no valid numerical covariates found in {original_csv_path} for MFSDA. "
+                         f"Ensure columns after '{expected_path_column}' are numeric or can be converted to numeric.")
+            return None
+            
+        logger.info(f"Prepared DataFrame for MFSDA with path column '{expected_path_column}' and numerical covariates: {actual_numerical_covariate_cols}")
+        return df_for_mfsda
 
     except Exception as e:
-        logger.error(f"Error reading or preparing data from longitudinal statistics CSV {original_csv_path}: {str(e)}")
-        return False
-
-    mfsda_run_path = getattr(config, "MFSDA_RUN_PATH", None)
-    mfsda_createshapes_path = getattr(config, "MFSDA_CREATE_SHAPES_PATH", None)
-    if not mfsda_run_path or not mfsda_createshapes_path: 
-        logger.error("MFSDA_RUN_PATH or MFSDA_CREATE_SHAPES_PATH not defined in config.py.")
-        return False
-
-    temp_csv_for_mfsda_fd = -1
-    temp_csv_for_mfsda_path = ""
-    success = False
-    try:
-        temp_csv_for_mfsda_fd, temp_csv_for_mfsda_path = tempfile.mkstemp(suffix='.csv', prefix='mfsda_longit_input_')
-        logger.info(f"Creating temporary MFSDA-compatible longitudinal CSV: {temp_csv_for_mfsda_path}")
-        df_for_mfsda.to_csv(temp_csv_for_mfsda_path, index=False)
-
-        success = run_mfsda_subprocess(
-            csv_path_for_mfsda=temp_csv_for_mfsda_path, 
-            output_dir=output_dir,
-            shape_template=shape_template, 
-            sphere_template_for_mfsda=sphere_template_for_mfsda,
-            mfsda_run_path=mfsda_run_path,
-            mfsda_createshapes_path=mfsda_createshapes_path,
-            slicersalt_path=config.SLICERSALT_PATH
-        )
-    except Exception as e_outer:
-        logger.error(f"Outer error during longitudinal MFSDA setup or execution: {e_outer}")
-        success = False
-    finally:
-        if temp_csv_for_mfsda_fd != -1:
-            try:
-                os.close(temp_csv_for_mfsda_fd)
-            except OSError as e:
-                logger.warning(f"Error closing temp file descriptor for {temp_csv_for_mfsda_path}: {e}")
-        if temp_csv_for_mfsda_path and os.path.exists(temp_csv_for_mfsda_path):
-            try:
-                os.remove(temp_csv_for_mfsda_path)
-                logger.info(f"Removed temporary MFSDA longitudinal CSV: {temp_csv_for_mfsda_path}")
-            except OSError as e:
-                logger.warning(f"Error removing temp file {temp_csv_for_mfsda_path}: {e}")
+        logger.error(f"Error reading or preparing data from CSV {original_csv_path} for MFSDA: {e}")
+        logger.exception("Detailed traceback:")
+        return None
 
 
-    if success:
-        logger.info(f"Longitudinal statistical analysis completed for {side} hemisphere. Results saved to {output_dir}")
-    else:
-        logger.error(f"Longitudinal statistical analysis failed for {side} hemisphere. Check logs for details.")
-    
-    return success
-
-def run_mfsda_subprocess(csv_path_for_mfsda: str, 
-                         output_dir: str, 
-                         shape_template: str, 
-                         sphere_template_for_mfsda: str, 
-                         mfsda_run_path: str, 
-                         mfsda_createshapes_path: str, 
-                         slicersalt_path: str) -> bool: 
-    
-    logger.info(f"Starting MFSDA subprocess with MFSDA-specific CSV: {csv_path_for_mfsda}")
+def run_mfsda_subprocess(csv_path_for_mfsda: str,
+                         output_dir: str,
+                         shape_template: str,
+                         sphere_template_for_mfsda: str,
+                         mfsda_run_path: str,
+                         mfsda_createshapes_path: str,
+                         slicersalt_path: str) -> bool:
+    """
+    Executes the MFSDA SlicerSALT modules (run and createShapes) using Popen for monitoring.
+    """
+    logger.info(f"Starting MFSDA processing with MFSDA-specific CSV: {csv_path_for_mfsda}")
     logger.info(f"MFSDA output directory: {output_dir}")
-    logger.info(f"MFSDA shape template (for createShapes): {shape_template}")
-    logger.info(f"MFSDA sphere template (for MFSDA_run coordData): {sphere_template_for_mfsda}")
 
-    mfsda_timeout = getattr(config, 'MFSDA_TIMEOUT_SECONDS', 7200) # Default to 2 hours if not in config
-    logger.info(f"MFSDA subprocess timeout set to: {mfsda_timeout} seconds.")
+    mfsda_timeout = getattr(config, 'MFSDA_TIMEOUT_SECONDS', 7200)
+    mfsda_run_phrase = getattr(config, 'MFSDA_RUN_COMPLETION_PHRASE', "The total elapsed time is")
+    mfsda_createshapes_phrase = getattr(config, 'MFSDA_CREATESHAPES_COMPLETION_PHRASE', None) 
 
-    for filepath_to_check in [csv_path_for_mfsda, shape_template, sphere_template_for_mfsda, slicersalt_path, mfsda_run_path, mfsda_createshapes_path]:
-        if not os.path.exists(filepath_to_check):
-            logger.error(f"MFSDA required file not found: {filepath_to_check}")
+
+    for required_file in [csv_path_for_mfsda, shape_template, sphere_template_for_mfsda,
+                          slicersalt_path, mfsda_run_path, mfsda_createshapes_path]:
+        if not os.path.exists(required_file):
+            logger.error(f"MFSDA required file/script not found: {required_file}")
             return False
-    
     try:
         temp_df_header = pd.read_csv(csv_path_for_mfsda, nrows=0).columns.tolist()
-        if not temp_df_header or len(temp_df_header) < 1 :
-             logger.error(f"Temporary MFSDA CSV {csv_path_for_mfsda} seems to have no header or is invalid.")
-             return False
+        if not temp_df_header or len(temp_df_header) < 1: # Should have at least path column
+            logger.error(f"Prepared MFSDA CSV {csv_path_for_mfsda} has no header or is invalid.")
+            return False
         
+        # Covariate names for MFSDA_createShapes are all columns *after* the first (path) column
         mfsda_create_shapes_covariates_names = temp_df_header[1:]
         covariates_str_for_createshapes = ' '.join(mfsda_create_shapes_covariates_names)
         
-        logger.info(f"MFSDA using subject path column from first column of: {csv_path_for_mfsda}")
-        logger.info(f"MFSDA numerical covariates (for createShapes) derived from columns: {covariates_str_for_createshapes if covariates_str_for_createshapes else 'None'}")
-        
+        logger.info(f"MFSDA using path column from: {csv_path_for_mfsda}")
+        logger.info(f"Covariate names for MFSDA_createShapes: '{covariates_str_for_createshapes if covariates_str_for_createshapes else 'None (or MFSDA_createShapes will use defaults)'}'")
+
+        # --- Step 1: Run MFSDA_run.py ---
         mfsda_run_command = [
             slicersalt_path, "--no-main-window", "--python-script", mfsda_run_path,
-            "--shapeData", csv_path_for_mfsda, 
-            "--coordData", sphere_template_for_mfsda, 
+            "--shapeData", csv_path_for_mfsda,
+            "--coordData", sphere_template_for_mfsda,
             "--outputDir", output_dir,
         ]
         
-        logger.info("Running MFSDA_run.py...")
-        logger.debug(f"MFSDA_run command: {' '.join(mfsda_run_command)}")
-        result_run = run_command(
-            mfsda_run_command,
-            description="Running MFSDA statistical computations",
-            check=False,
-            timeout=mfsda_timeout # Apply timeout
+        run_success = _run_slicersalt_module_monitor_output(
+            command_list=mfsda_run_command,
+            completion_phrase=mfsda_run_phrase,
+            timeout_seconds=mfsda_timeout,
+            description="MFSDA statistical computations (MFSDA_run.py)"
         )
-        if result_run.stdout: logger.info(f"MFSDA_run STDOUT:\n{result_run.stdout}")
-        if result_run.stderr: logger.warning(f"MFSDA_run STDERR:\n{result_run.stderr}") 
-        
-        if result_run.returncode != 0:
-            logger.error(f"MFSDA_run.py failed with return code {result_run.returncode}. Check for timeout messages above if applicable.")
+
+        if not run_success:
+            logger.error("MFSDA_run.py SlicerSALT module execution failed or timed out.")
             return False
-            
+        logger.info("MFSDA_run.py SlicerSALT module processing deemed complete.")
+
         pvalues_file = os.path.join(output_dir, 'pvalues.json')
         efit_file = os.path.join(output_dir, 'efit.json')
-        
         if not os.path.exists(pvalues_file) or not os.path.exists(efit_file):
-            logger.error(f"MFSDA_run.py did not create expected output files (pvalues.json, efit.json) in {output_dir}")
+            logger.error(f"MFSDA_run.py did not create expected output files (pvalues.json, efit.json) in {output_dir} despite apparent completion.")
             return False
-            
-        try:
-            with open(pvalues_file, 'r') as f:
-                pvalues_data = json.load(f)
-                min_pval_val = "N/A" 
-                if 'Gpvals' in pvalues_data and isinstance(pvalues_data['Gpvals'], list) and pvalues_data['Gpvals']:
-                    min_pval_val = min(pvalues_data['Gpvals'])
-                elif isinstance(pvalues_data, list) and pvalues_data: 
-                    min_pval_val = min(pvalues_data)
-                logger.info(f"MFSDA pvalues.json content summary: Min Gpval (if applicable) ~ {min_pval_val}")
-        except Exception as e:
-            logger.warning(f"Could not read or parse p-values file {pvalues_file}: {str(e)}")
-        
-        output_vtk_filename = f"MFSDA_visualization_{Path(csv_path_for_mfsda).stem.replace('mfsda_input_', '').replace('mfsda_static_input_', '').replace('mfsda_longit_input_', '')}.vtk"
+
+        # --- Step 2: Run MFSDA_createShapes.py ---
+        input_csv_stem = Path(csv_path_for_mfsda).stem
+        # Clean up common prefixes from temp file names for a cleaner output VTK name
+        cleaned_stem = input_csv_stem
+        for prefix_to_remove in ['mfsda_input_', 'mfsda_static_input_', 'mfsda_longit_input_', 'mfsda_static_left_', 'mfsda_static_right_', 'mfsda_longitudinal_left_', 'mfsda_longitudinal_right_']:
+            if cleaned_stem.startswith(prefix_to_remove):
+                cleaned_stem = cleaned_stem[len(prefix_to_remove):]
+        output_vtk_filename = f"MFSDA_visualization_{cleaned_stem}.vtk"
         output_vtk_path = os.path.join(output_dir, output_vtk_filename)
-        
+
         mfsda_create_shapes_command = [
             slicersalt_path, "--no-main-window", "--python-script", mfsda_createshapes_path,
-            "--shape", shape_template, 
+            "--shape", shape_template,
             "--pvalues", pvalues_file,
             "--efit", efit_file,
+            "--output", output_vtk_path
         ]
+        # Only add the --covariates argument if there are actual covariate names to pass
         if covariates_str_for_createshapes:
-             mfsda_create_shapes_command.extend(["--covariates", covariates_str_for_createshapes])
-        mfsda_create_shapes_command.extend(["--output", output_vtk_path])
+            mfsda_create_shapes_command.extend(["--covariates", covariates_str_for_createshapes])
+        else:
+            logger.info("No covariate names to pass to MFSDA_createShapes.py; it may use defaults or not require them if only one group/no covariates.")
 
-        logger.info("Running MFSDA_createShapes.py...")
-        logger.debug(f"MFSDA_createShapes command: {' '.join(mfsda_create_shapes_command)}")
-        result_create = run_command(
-            mfsda_create_shapes_command,
-            description="Creating MFSDA shape visualization",
-            check=False,
-            timeout=mfsda_timeout # Apply timeout
+
+        create_shapes_success = _run_slicersalt_module_monitor_output(
+            command_list=mfsda_create_shapes_command,
+            completion_phrase=mfsda_createshapes_phrase, 
+            timeout_seconds=mfsda_timeout,
+            description="Creating MFSDA shape visualization (MFSDA_createShapes.py)"
         )
-        if result_create.stdout: logger.info(f"MFSDA_createShapes STDOUT:\n{result_create.stdout}")
-        if result_create.stderr: logger.warning(f"MFSDA_createShapes STDERR:\n{result_create.stderr}")
 
-        if result_create.returncode != 0:
-            logger.error(f"MFSDA_createShapes.py failed with return code {result_create.returncode}. Check for timeout messages above if applicable.")
+        if not create_shapes_success:
+            logger.error("MFSDA_createShapes.py SlicerSALT module execution failed or timed out.")
             return False
         
         if not os.path.exists(output_vtk_path):
-            logger.error(f"MFSDA_createShapes.py did not create the expected output VTK file: {output_vtk_path}")
+            logger.error(f"MFSDA_createShapes.py did not create the expected output VTK file: {output_vtk_path} despite apparent completion.")
             return False
-
-        logger.info(f"MFSDA analysis completed successfully. Visualization: {output_vtk_path}")
+        
+        logger.info(f"MFSDA_createShapes.py SlicerSALT module processing deemed complete. Visualization: {output_vtk_path}")
         return True
-    
+
     except Exception as e:
-        logger.error(f"Error during MFSDA subprocess execution: {str(e)}")
-        logger.exception("Detailed traceback for MFSDA error:")
+        logger.error(f"An unexpected error occurred during MFSDA subprocess orchestration: {e}")
+        logger.exception("Detailed traceback:")
         return False
 
-# --- Functions below this line are for M2MD and Delta Model generation ---
-# --- They are assumed to be mostly correct from previous versions ---
-# --- but reviewed for basic consistency with the MFSDA changes. ---
+
+def run_analysis_with_mfsda(analysis_type: str, side: str, expected_path_column: str) -> bool:
+    """Helper function to run MFSDA for static or longitudinal analysis."""
+    print_section_header(f"{analysis_type.upper()} STATISTICAL ANALYSIS (MFSDA): {side.upper()} HEMISPHERE")
+
+    try:
+        if analysis_type == "static":
+            original_csv_path = config.get_paths_by_side(side, "static_csv")
+            output_dir = config.get_paths_by_side(side, "stats_static_output")
+        elif analysis_type == "longitudinal":
+            original_csv_path = config.get_paths_by_side(side, "longit_stats_csv")
+            output_dir = config.get_paths_by_side(side, "stats_longit_output")
+        else:
+            logger.error(f"Unknown analysis type for MFSDA: {analysis_type}")
+            return False
+        shape_template = config.get_paths_by_side(side, "sphere_template")
+        sphere_template_for_mfsda = config.get_paths_by_side(side, "sphere_template")
+    except (ValueError, AttributeError) as e:
+        logger.error(f"Configuration error getting paths for {analysis_type} MFSDA (side: {side}): {e}")
+        return False
+
+    if not os.path.exists(original_csv_path):
+        logger.error(f"{analysis_type.capitalize()} analysis base CSV not found: {original_csv_path}")
+        return False
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as e:
+        logger.error(f"Could not create output directory {output_dir} for {analysis_type} MFSDA: {e}")
+        return False
+
+    logger.info(f"Preparing data for {analysis_type} MFSDA from base CSV: {original_csv_path}")
+    df_for_mfsda = _prepare_mfsda_dataframe(original_csv_path, expected_path_column)
+    if df_for_mfsda is None: # _prepare_mfsda_dataframe now returns None on critical failure
+        logger.error(f"Failed to prepare MFSDA-compatible DataFrame from {original_csv_path}. Halting MFSDA for this run.")
+        return False
+
+    slicersalt_path = getattr(config, "SLICERSALT_PATH", None)
+    mfsda_run_path = getattr(config, "MFSDA_RUN_PATH", None)
+    mfsda_createshapes_path = getattr(config, "MFSDA_CREATE_SHAPES_PATH", None)
+
+    for p, name in [(slicersalt_path, "SLICERSALT_PATH"), (mfsda_run_path, "MFSDA_RUN_PATH"), 
+                    (mfsda_createshapes_path, "MFSDA_CREATE_SHAPES_PATH")]:
+        if not p or not os.path.exists(p):
+            logger.error(f"{name} ('{p}') not defined in config.py or does not exist. Cannot run MFSDA.")
+            return False
+
+    temp_csv_fd = -1
+    temp_csv_path = ""
+    analysis_success = False
+    try:
+        # Use a more descriptive prefix for the temp file
+        temp_file_prefix = f'mfsda_{analysis_type}_{side}_processed_input_'
+        temp_csv_fd, temp_csv_path = tempfile.mkstemp(suffix='.csv', prefix=temp_file_prefix)
+        logger.info(f"Creating temporary MFSDA-compatible CSV: {temp_csv_path}")
+        df_for_mfsda.to_csv(temp_csv_path, index=False)
+        
+        analysis_success = run_mfsda_subprocess(
+            csv_path_for_mfsda=temp_csv_path,
+            output_dir=output_dir,
+            shape_template=shape_template,
+            sphere_template_for_mfsda=sphere_template_for_mfsda,
+            mfsda_run_path=mfsda_run_path,
+            mfsda_createshapes_path=mfsda_createshapes_path,
+            slicersalt_path=slicersalt_path
+        )
+    except Exception as e_outer:
+        logger.error(f"Outer error during {analysis_type} MFSDA setup or execution for {side} side: {e_outer}")
+        logger.exception("Detailed traceback:")
+        analysis_success = False
+    finally:
+        if temp_csv_fd != -1:
+            try: os.close(temp_csv_fd)
+            except OSError as e: logger.warning(f"Error closing temp file descriptor for {temp_csv_path}: {e}")
+        if temp_csv_path and os.path.exists(temp_csv_path):
+            try: 
+                os.remove(temp_csv_path)
+                logger.info(f"Removed temporary MFSDA CSV: {temp_csv_path}")
+            except OSError as e: logger.warning(f"Error removing temp file {temp_csv_path}: {e}")
+
+    if analysis_success:
+        logger.info(f"{analysis_type.capitalize()} statistical analysis (MFSDA) completed for {side} hemisphere.")
+    else:
+        logger.error(f"{analysis_type.capitalize()} statistical analysis (MFSDA) failed for {side} hemisphere.")
+    return analysis_success
+
+
+def run_static_analysis(side: str = "left") -> bool:
+    return run_analysis_with_mfsda("static", side, expected_path_column="SubjectPath")
+
+def run_longitudinal_analysis(side: str = "left") -> bool:
+    return run_analysis_with_mfsda("longitudinal", side, expected_path_column="DeltaModelPath")
+
+
+# --- M2MD and Delta Model Generation Functions ---
+# (Assumed to be generally functional from previous versions)
 
 def prepare_longitudinal_data(side: str = "left") -> bool:
     print_section_header(f"LONGITUDINAL DATA PREPARATION (M2MD): {side.upper()} HEMISPHERE")
-    
     try:
         m2md_input_csv_path = config.get_paths_by_side(side, "longit_m2md_csv")
-        m2md_output_dir = config.get_paths_by_side(side, "m2md_output") 
+        m2md_tool_output_dir = config.get_paths_by_side(side, "m2md_output") 
         delta_models_final_dir = config.get_paths_by_side(side, "delta_models_output") 
-    except ValueError as e:
-        logger.error(f"Configuration error getting paths for longitudinal data prep (side: {side}): {e}")
+        slicersalt_path = getattr(config, "SLICERSALT_PATH", None)
+    except (ValueError, AttributeError) as e:
+        logger.error(f"Configuration error getting paths for M2MD (side: {side}): {e}")
         return False
-    except AttributeError as e:
-        logger.error(f"Configuration error: {e}. A required path variable might be missing in config.py.")
+    if not slicersalt_path or not os.path.exists(slicersalt_path):
+        logger.error(f"SlicerSALT path ('{slicersalt_path}') not defined or does not exist. Cannot run M2MD.")
         return False
-
-    try:
-        os.makedirs(m2md_output_dir, exist_ok=True)
-        logger.info(f"Ensured M2MD output directory exists: {m2md_output_dir}")
-        os.makedirs(delta_models_final_dir, exist_ok=True)
-        logger.info(f"Ensured delta models final directory exists: {delta_models_final_dir}")
-    except OSError as e:
-        logger.error(f"Could not create output directories for longitudinal data: {e}")
-        return False
-        
-    if not os.path.exists(m2md_input_csv_path):
-        logger.error(f"M2MD input CSV file not found: {m2md_input_csv_path}. This file should define Timepoint1, Timepoint2, and Output names.")
-        return False
-    
-    try:
-        df = pd.read_csv(m2md_input_csv_path)
-        required_cols = ['Timepoint 1', 'Timepoint 2', 'Output'] 
-        if not all(col in df.columns for col in required_cols):
-            logger.error(f"M2MD input CSV {m2md_input_csv_path} is missing one or more required columns: {required_cols}")
+    for m_dir in [m2md_tool_output_dir, delta_models_final_dir]:
+        try:
+            os.makedirs(m_dir, exist_ok=True)
+            logger.info(f"Ensured directory exists: {m_dir}")
+        except OSError as e:
+            logger.error(f"Could not create directory {m_dir} for M2MD: {e}")
             return False
-        if df.empty:
+    if not os.path.exists(m2md_input_csv_path):
+        logger.error(f"M2MD input CSV not found: {m2md_input_csv_path}.")
+        return False
+    try:
+        df_m2md_pairs = pd.read_csv(m2md_input_csv_path)
+        required_cols = ['Timepoint 1', 'Timepoint 2', 'Output'] 
+        if not all(col in df_m2md_pairs.columns for col in required_cols):
+            logger.error(f"M2MD input CSV {m2md_input_csv_path} is missing required columns: {required_cols}")
+            return False
+        if df_m2md_pairs.empty:
             logger.warning(f"M2MD input CSV {m2md_input_csv_path} is empty. No pairs to process.")
             return True 
     except Exception as e:
         logger.error(f"Error reading or validating M2MD input CSV {m2md_input_csv_path}: {e}")
         return False
-        
-    m2md_success = run_m2md_slicer_script(
+    m2md_script_success = run_m2md_slicer_script(
         input_csv_for_pairs=m2md_input_csv_path, 
-        m2md_tool_output_dir=m2md_output_dir, 
-        slicersalt_path=config.SLICERSALT_PATH
+        m2md_tool_output_dir=m2md_tool_output_dir, 
+        slicersalt_path=slicersalt_path
     )
-    
-    if not m2md_success:
+    if not m2md_script_success:
         logger.error(f"M2MD Slicer script execution failed for {side} hemisphere.")
         return False
-    
-    m2md_results_summary_csv = os.path.join(m2md_output_dir, "M2MD_results.csv") 
+    m2md_results_summary_csv = os.path.join(m2md_tool_output_dir, "M2MD_results.csv") 
     if not os.path.exists(m2md_results_summary_csv):
-        logger.error(f"M2MD Slicer script did not create the expected results summary CSV: {m2md_results_summary_csv}")
+        logger.error(f"M2MD Slicer script did not create the expected summary CSV: {m2md_results_summary_csv}")
         return False
-        
-    delta_generation_success = generate_delta_models_from_m2md_outputs(
+    delta_gen_success = generate_delta_models_from_m2md_outputs(
         m2md_results_summary_csv=m2md_results_summary_csv, 
         final_delta_models_dir=delta_models_final_dir
     )
-    
-    if not delta_generation_success:
+    if not delta_gen_success:
         logger.error(f"Generation of final delta models failed for {side} hemisphere.")
         return False
-            
-    logger.info(f"Longitudinal data preparation (M2MD and delta model generation) completed for {side} hemisphere.")
-    logger.info(f"M2MD outputs are in: {m2md_output_dir}")
-    logger.info(f"Final delta models for statistical analysis are in: {delta_models_final_dir}")
+    logger.info(f"Longitudinal data preparation (M2MD & delta models) completed for {side} hemisphere.")
     return True
 
 def run_m2md_slicer_script(input_csv_for_pairs: str, m2md_tool_output_dir: str, slicersalt_path: str) -> bool:
-    logger.info(f"Running Model-to-Model Distance Slicer script for CSV: {input_csv_for_pairs}")
-    abs_input_csv_for_pairs = os.path.abspath(input_csv_for_pairs)
-    abs_m2md_tool_output_dir = os.path.abspath(m2md_tool_output_dir)
-    
+    logger.info(f"Preparing to run ModelToModelDistance Slicer script using CSV: {input_csv_for_pairs}")
+    abs_input_csv = os.path.abspath(input_csv_for_pairs)
+    abs_output_dir = os.path.abspath(m2md_tool_output_dir)
     script_fd, script_path = tempfile.mkstemp(suffix='.py', prefix='m2md_slicer_script_')
-    
     try:
-        # Using f-strings with raw string literals for paths, ensure correctness for the embedded script
+        # Minified the M2MD script content for brevity in this example
         m2md_script_content = f"""
-# M2MD Script for SlicerSALT
-import os
-import numpy as np
-import pandas as pd
-import slicer 
-import logging 
-
-# Basic script logger setup within the Slicer environment
-# Note: Slicer's Python environment might handle logging differently.
-# Print statements are often more reliable for seeing output from Slicer --python-script.
-print(f"M2MD Slicer Script started.")
-print(f"Input CSV for pairs: {{abs_input_csv_for_pairs!r}}") # !r for repr to handle escapes
-print(f"Output directory for M2MD results: {{abs_m2md_tool_output_dir!r}}")
-
+# Dynamically generated Slicer script for ModelToModelDistance
+import os, numpy as np, pandas as pd, slicer, logging
+print(f"[M2MD Slicer Script] Started. Input CSV: {{abs_input_csv!r}}, Output Dir: {{abs_output_dir!r}}")
+try: os.makedirs(r"{abs_output_dir}", exist_ok=True)
+except Exception as e: print(f"[M2MD Slicer Script] ERROR creating output dir: {{e}}"); slicer.app.exit(1)
 try:
-    os.makedirs(r"{abs_m2md_tool_output_dir}", exist_ok=True)
-    print(f"Ensured M2MD output directory exists: {{abs_m2md_tool_output_dir!r}}")
-except Exception as e:
-    print(f"Failed to create M2MD output directory {{abs_m2md_tool_output_dir!r}}: {{e}}")
-    slicer.app.exit(1)
-
-try:
-    data = pd.read_csv(r"{abs_input_csv_for_pairs}")
-    if data.empty:
-        print(f"Input CSV {{abs_input_csv_for_pairs!r}} is empty. No pairs to process.")
-        slicer.app.exit(0) 
-        
-    required_columns = ['Timepoint 1', 'Timepoint 2', 'Output']
-    if not all(col in data.columns for col in required_columns):
-        print(f"Error: CSV {{abs_input_csv_for_pairs!r}} is missing one or more required columns: {{required_columns}}")
-        slicer.app.exit(1)
-            
-    tp1_subjects_paths = data['Timepoint 1'].tolist()
-    tp2_subjects_paths = data['Timepoint 2'].tolist()
-    output_base_names = data['Output'].tolist() 
-    
-    m2md_results_data = [] 
-
-    print(f"Found {{len(tp1_subjects_paths)}} pairs to process from {{abs_input_csv_for_pairs!r}}.")
-
-    for i in range(len(tp1_subjects_paths)):
-        tp1_subj_path = tp1_subjects_paths[i]
-        tp2_subj_path = tp2_subjects_paths[i]
-        output_subj_base_name = output_base_names[i]
-        
-        print(f"Processing pair {{i+1}}/{{len(tp1_subjects_paths)}}: {{output_subj_base_name}}")
-        print(f"  Timepoint 1: {{tp1_subj_path}}")
-        print(f"  Timepoint 2: {{tp2_subj_path}}")
-
-        if not os.path.exists(tp1_subj_path):
-            print(f"  Skipping pair {{output_subj_base_name}}: Timepoint 1 file not found: {{tp1_subj_path}}")
-            continue
-        if not os.path.exists(tp2_subj_path):
-            print(f"  Skipping pair {{output_subj_base_name}}: Timepoint 2 file not found: {{tp2_subj_path}}")
-            continue
-
+    df_pairs = pd.read_csv(r"{abs_input_csv}")
+    if df_pairs.empty: print(f"[M2MD Slicer Script] Input CSV empty. Exiting."); slicer.app.exit(0)
+    if not all(c in df_pairs.columns for c in ['Timepoint 1','Timepoint 2','Output']):
+        print(f"[M2MD Slicer Script] ERROR: CSV missing required columns."); slicer.app.exit(1)
+    results = []
+    print(f"[M2MD Slicer Script] Processing {{len(df_pairs)}} pairs.")
+    for idx, r in df_pairs.iterrows():
+        tp1, tp2, out_base = r['Timepoint 1'], r['Timepoint 2'], r['Output']
+        print(f"[M2MD Slicer Script] Pair {{idx+1}}: {{out_base}} (TP1:{{tp1}}, TP2:{{tp2}})")
+        if not os.path.exists(tp1) or not os.path.exists(tp2):
+            print(f"  SKIPPING: File(s) not found."); results.append({{'Input_Output_BaseName':out_base,'Status':'Skipped - File Missing','Output_M2MD_VTK_Path':None,'Output_DistanceScalars_CSV_Path':None,'Input_Timepoint1_Path':tp1,'Input_Timepoint2_Path':tp2}}); continue
+        ok, vtk_out, csv_out = False, os.path.join(r"{abs_output_dir}",out_base+"_m2md.vtk"), os.path.join(r"{abs_output_dir}",out_base+"_DistanceScalars.csv")
         try:
-            slicer.mrmlScene.Clear(0) 
-            
-            model1_node = slicer.util.loadModel(tp1_subj_path)
-            if not model1_node:
-                print(f"  Failed to load Timepoint 1 model: {{tp1_subj_path}}")
-                continue
-            model2_node = slicer.util.loadModel(tp2_subj_path)
-            if not model2_node:
-                print(f"  Failed to load Timepoint 2 model: {{tp2_subj_path}}")
-                continue
-            
-            output_m2md_vtk_path = os.path.join(r"{abs_m2md_tool_output_dir}", output_subj_base_name + "_m2md.vtk")
-            output_distance_scalars_csv_path = os.path.join(r"{abs_m2md_tool_output_dir}", output_subj_base_name + "_DistanceScalars.csv")
-            
-            slicer_output_node_name = output_subj_base_name + "_M2MDResult"
-            output_model_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", slicer_output_node_name)
-            if not output_model_node:
-                print(f"  Failed to create output node for M2MD result: {{slicer_output_node_name}}")
-                continue
-
-            # Parameter names for ModelToModelDistance can vary slightly by Slicer version.
-            # Common names are 'sourceModel', 'targetModel', 'outputModel'.
-            # Check your Slicer version's CLI documentation if these don't work.
-            params = {{
-                'sourceModel': model1_node.GetID(), 
-                'targetModel': model2_node.GetID(), 
-                'outputModel': output_model_node.GetID(), 
-                # 'distanceType': 'point_to_cell', # Example optional parameter
-                # 'signedDistance': False          # Example optional parameter
-            }}
-            
-            print(f"  Running ModelToModelDistance CLI module...")
-            cli_module = slicer.modules.modeltomodeldistance
-            cli_node = slicer.cli.runSync(cli_module, None, params) 
-
-            if cli_node.GetStatusString() == "Completed":
-                print(f"  ModelToModelDistance completed for {{output_subj_base_name}}.")
-                if not slicer.util.saveNode(output_model_node, output_m2md_vtk_path):
-                    print(f"  Failed to save output M2MD model: {{output_m2md_vtk_path}}")
-                else:
-                    print(f"  Output M2MD model saved: {{output_m2md_vtk_path}}")
-                
-                distance_array_vtk = output_model_node.GetPolyData().GetPointData().GetScalars("Distance") # Default scalar name
-                if distance_array_vtk:
-                    num_points = distance_array_vtk.GetNumberOfTuples()
-                    distance_values_np = np.array([distance_array_vtk.GetTuple1(i) for i in range(num_points)])
-                    np.savetxt(output_distance_scalars_csv_path, distance_values_np, delimiter=",", fmt='%f', comments='')
-                    print(f"  Distance array saved: {{output_distance_scalars_csv_path}}")
-                    
-                    m2md_results_data.append({{
-                        'Input_Timepoint1_Path': tp1_subj_path,
-                        'Input_Timepoint2_Path': tp2_subj_path,
-                        'Input_Output_BaseName': output_subj_base_name,
-                        'Output_M2MD_VTK_Path': output_m2md_vtk_path,
-                        'Output_DistanceScalars_CSV_Path': output_distance_scalars_csv_path 
-                    }})
-                else:
-                    print(f"  Could not extract 'Distance' array from M2MD output for {{output_subj_base_name}}.")
-                    m2md_results_data.append({{
-                        'Input_Timepoint1_Path': tp1_subj_path,
-                        'Input_Timepoint2_Path': tp2_subj_path,
-                        'Input_Output_BaseName': output_subj_base_name,
-                        'Output_M2MD_VTK_Path': output_m2md_vtk_path, 
-                        'Output_DistanceScalars_CSV_Path': None 
-                    }})
-            else:
-                print(f"  ModelToModelDistance failed for {{output_subj_base_name}}. Status: {{cli_node.GetStatusString()}}")
-        except Exception as pair_e:
-            print(f"  Error processing pair {{output_subj_base_name}}: {{str(pair_e)}}")
-            import traceback
-            print(traceback.format_exc())
-            continue 
-    
-    if m2md_results_data:
-        results_df = pd.DataFrame(m2md_results_data)
-        summary_csv_path = os.path.join(r"{abs_m2md_tool_output_dir}", "M2MD_results.csv")
-        results_df.to_csv(summary_csv_path, index=False)
-        print(f"M2MD processing summary saved to: {{summary_csv_path}}")
-    else:
-        print("No M2MD pairs were successfully processed to create a summary CSV.")
-
-    print(f"M2MD Slicer Script finished.")
-    slicer.app.exit(0) 
-
-except Exception as main_e:
-    print(f"Critical error in M2MD Slicer Script: {{str(main_e)}}")
-    import traceback
-    print(traceback.format_exc())
-    slicer.app.exit(1) 
+            slicer.mrmlScene.Clear(0); n1,n2 = slicer.util.loadModel(tp1),slicer.util.loadModel(tp2)
+            if not n1 or not n2: raise RuntimeError("Model load fail")
+            onode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode",out_base+"_M2MDResult")
+            if not onode: raise RuntimeError("MRML node creation fail")
+            params = {{'sourceModel':n1.GetID(),'targetModel':n2.GetID(),'outputModel':onode.GetID()}}
+            print(f"  Running CLI..."); cli = slicer.cli.runSync(slicer.modules.modeltomodeldistance,None,params)
+            if cli.GetStatusString()=="Completed":
+                print(f"  CLI OK."); slicer.util.saveNode(onode,vtk_out)
+                pd_ = onode.GetPolyData()
+                if pd_ and pd_.GetPointData() and pd_.GetPointData().GetScalars("Distance"):
+                    arr = pd_.GetPointData().GetScalars("Distance"); n = arr.GetNumberOfTuples()
+                    np.savetxt(csv_out,np.array([arr.GetTuple1(i) for i in range(n)]),delimiter=",",fmt='%f',comments='')
+                    print(f"  Saved scalars: {{csv_out}}"); ok=True
+                else: print(f"  WARN: No 'Distance' scalars.")
+            else: print(f"  ERR: CLI fail: {{cli.GetStatusString()}}")
+        except Exception as e_p: print(f"  ERR pair proc: {{e_p}}"); import traceback; traceback.print_exc()
+        results.append({{'Input_Output_BaseName':out_base,'Status':'Completed' if ok else 'Failed','Output_M2MD_VTK_Path':vtk_out if os.path.exists(vtk_out) else None,'Output_DistanceScalars_CSV_Path':csv_out if os.path.exists(csv_out) else None,'Input_Timepoint1_Path':tp1,'Input_Timepoint2_Path':tp2}})
+    if results: pd.DataFrame(results).to_csv(os.path.join(r"{abs_output_dir}","M2MD_results.csv"),index=False); print(f"[M2MD Slicer Script] Summary saved.")
+    else: print("[M2MD Slicer Script] No results to log.")
+    print(f"[M2MD Slicer Script] Finished."); slicer.app.exit(0)
+except Exception as e_m: print(f"[M2MD Slicer Script] CRITICAL ERR: {{e_m}}"); import traceback; traceback.print_exc(); slicer.app.exit(1)
 """
-        with os.fdopen(script_fd, 'w') as f:
-            f.write(m2md_script_content)
-            
-        slicer_command = [
-            slicersalt_path,
-            "--no-main-window", 
-            "--python-script", script_path
-        ]
-        
-        logger.info(f"Executing M2MD Slicer script via command: {' '.join(slicer_command)}")
-        m2md_timeout = getattr(config, 'SPHARM_TIMEOUT_SECONDS', 7200) # Reuse SPHARM timeout or define a new one
-        result = run_command(
-            slicer_command,
-            description=f"Running Model-to-Model Distance via SlicerSALT (CSV: {os.path.basename(input_csv_for_pairs)})",
-            check=False, 
-            timeout=m2md_timeout 
-        )
-        
-        if result.stdout: logger.info(f"M2MD Slicer script STDOUT (captured by Python):\n{result.stdout}")
-        if result.stderr: logger.warning(f"M2MD Slicer script STDERR (captured by Python):\n{result.stderr}")
-
-        if result.returncode != 0:
-            logger.error(f"M2MD Slicer script failed with SlicerSALT return code {result.returncode}")
-            return False
-            
-        m2md_results_summary_csv = os.path.join(abs_m2md_tool_output_dir, "M2MD_results.csv")
-        if not os.path.exists(m2md_results_summary_csv):
-            logger.error(f"M2MD Slicer script completed (return code 0) but did not create the expected summary results file: {m2md_results_summary_csv}.")
-            return False
-            
-        logger.info(f"M2MD Slicer script completed. Summary results expected at: {m2md_results_summary_csv}")
-        return True
-            
-    except Exception as e:
-        logger.error(f"Error setting up or running M2MD Slicer script: {str(e)}")
-        logger.exception("Detailed traceback for M2MD Slicer script setup/run error:")
-        return False
+        with os.fdopen(script_fd, 'w') as f: f.write(m2md_script_content)
+        slicer_cmd_list = [slicersalt_path, "--no-main-window", "--python-script", script_path]
+        logger.info(f"Executing M2MD Slicer script: {' '.join(slicer_cmd_list)}")
+        m2md_timeout = getattr(config, 'SPHARM_TIMEOUT_SECONDS', 7200)
+        result = run_command(slicer_cmd_list, description="Running ModelToModelDistance via SlicerSALT", check=False, timeout=m2md_timeout)
+        if result.stdout: logger.debug(f"M2MD Slicer script STDOUT:\n{result.stdout}") 
+        if result.stderr: logger.debug(f"M2MD Slicer script STDERR:\n{result.stderr}") 
+        if result.returncode == -1: logger.error(f"M2MD Slicer script call timed out."); return False
+        if result.returncode != 0: logger.error(f"M2MD Slicer script failed (rc={result.returncode})."); return False
+        summary_csv = os.path.join(abs_output_dir, "M2MD_results.csv")
+        if not os.path.exists(summary_csv): logger.error(f"M2MD summary CSV missing: {summary_csv}"); return False
+        logger.info(f"M2MD Slicer script completed. Summary: {summary_csv}"); return True
+    except Exception as e: logger.error(f"M2MD setup/run error: {e}"); logger.exception("Traceback:"); return False
     finally:
-        if os.path.exists(script_path): # script_fd is closed by with os.fdopen
-            try:
-                os.remove(script_path)
-                logger.debug(f"Removed temporary M2MD Slicer script: {script_path}")
-            except OSError as e:
-                logger.warning(f"Could not remove temporary M2MD Slicer script: {script_path}: {e}")
+        if os.path.exists(script_path):
+            try: os.remove(script_path)
+            except OSError as e: logger.warning(f"Could not remove temp M2MD script {script_path}: {e}")
 
 def generate_delta_models_from_m2md_outputs(m2md_results_summary_csv: str, final_delta_models_dir: str) -> bool:
-    logger.info(f"Generating final delta models from M2MD summary: {m2md_results_summary_csv}")
-    logger.info(f"Output directory for final delta models: {final_delta_models_dir}")
-
-    if not os.path.exists(m2md_results_summary_csv):
-        logger.error(f"M2MD results summary CSV not found: {m2md_results_summary_csv}")
-        return False
-    
+    logger.info(f"Generating delta models from M2MD summary: {m2md_results_summary_csv} -> {final_delta_models_dir}")
+    if not os.path.exists(m2md_results_summary_csv): logger.error(f"M2MD summary CSV not found: {m2md_results_summary_csv}"); return False
+    try: os.makedirs(final_delta_models_dir, exist_ok=True)
+    except OSError as e: logger.error(f"Could not create delta models dir {final_delta_models_dir}: {e}"); return False
     try:
-        os.makedirs(final_delta_models_dir, exist_ok=True)
-    except OSError as e:
-        logger.error(f"Could not create final delta models directory {final_delta_models_dir}: {e}")
-        return False
-
-    try:
-        m2md_df = pd.read_csv(m2md_results_summary_csv)
-        if m2md_df.empty:
-            logger.warning(f"M2MD results summary CSV {m2md_results_summary_csv} is empty. No delta models to generate.")
-            return True 
-
-        required_cols = ['Input_Timepoint1_Path', 'Output_DistanceScalars_CSV_Path', 'Input_Output_BaseName']
-        if not all(col in m2md_df.columns for col in required_cols):
-            logger.error(f"M2MD summary CSV {m2md_results_summary_csv} is missing one or more required columns: {required_cols}")
-            return False
-
-        success_count = 0
-        failure_count = 0
-
-        try:
-            import vtk
-        except ImportError:
-            logger.error("VTK Python package is not installed. Cannot generate delta models. Please install with 'pip install vtk'.")
-            return False
-
-        for index, row in m2md_df.iterrows():
-            base_vtk_path = row['Input_Timepoint1_Path']
-            distance_scalars_csv_path = row.get('Output_DistanceScalars_CSV_Path') 
-            output_base_name = row['Input_Output_BaseName']
-            
-            final_delta_vtk_filename = f"{output_base_name}_delta.vtk" 
-            final_delta_vtk_path = os.path.join(final_delta_models_dir, final_delta_vtk_filename)
-
-            if pd.isna(distance_scalars_csv_path) or not distance_scalars_csv_path:
-                logger.warning(f"Skipping delta model for '{output_base_name}': DistanceScalars CSV path is missing or invalid in summary.")
-                failure_count +=1
-                continue
-            if not os.path.exists(base_vtk_path):
-                logger.error(f"Skipping delta model for '{output_base_name}': Base VTK (Timepoint 1) not found: {base_vtk_path}")
-                failure_count +=1
-                continue
-            if not os.path.exists(distance_scalars_csv_path):
-                logger.error(f"Skipping delta model for '{output_base_name}': DistanceScalars CSV not found: {distance_scalars_csv_path}")
-                failure_count +=1
-                continue
-
-            logger.info(f"Generating delta model: {final_delta_vtk_path}")
-            logger.debug(f"  Using base VTK: {base_vtk_path}")
-            logger.debug(f"  Using distance scalars: {distance_scalars_csv_path}")
-
+        df_results = pd.read_csv(m2md_results_summary_csv)
+        if df_results.empty: logger.info("M2MD summary empty. No delta models."); return True
+        req_cols = ['Input_Timepoint1_Path', 'Output_DistanceScalars_CSV_Path', 'Input_Output_BaseName', 'Status']
+        if not all(c in df_results.columns for c in req_cols): logger.error(f"M2MD summary CSV missing cols from: {req_cols}"); return False
+        s_count, a_count = 0, 0
+        import vtk 
+        for idx, r in df_results.iterrows():
+            a_count +=1
+            if r.get('Status') != 'Completed': logger.warning(f"Skipping delta for '{r['Input_Output_BaseName']}': M2MD status '{r.get('Status','Unknown')}'"); continue
+            base_vtk, scalars_csv, out_base = r['Input_Timepoint1_Path'], r.get('Output_DistanceScalars_CSV_Path'), r['Input_Output_BaseName']
+            delta_vtk_file = os.path.join(final_delta_models_dir, f"{out_base}_delta.vtk")
+            if pd.isna(scalars_csv) or not scalars_csv: logger.warning(f"Skipping delta for '{out_base}': Scalars CSV path missing."); continue
+            if not os.path.exists(base_vtk): logger.error(f"Skipping delta for '{out_base}': Base VTK missing: {base_vtk}"); continue
+            if not os.path.exists(scalars_csv): logger.error(f"Skipping delta for '{out_base}': Scalars CSV missing: {scalars_csv}"); continue
+            logger.info(f"Generating delta model for '{out_base}'")
             try:
-                distance_values = pd.read_csv(distance_scalars_csv_path, header=None).values.astype(float).flatten()
-                
-                reader = vtk.vtkPolyDataReader()
-                reader.SetFileName(base_vtk_path)
-                reader.Update()
-                polydata = reader.GetOutput()
-
-                if not polydata or polydata.GetNumberOfPoints() == 0:
-                    logger.error(f"  Failed to read base VTK or it's empty: {base_vtk_path} for {output_base_name}.")
-                    failure_count +=1
-                    continue
-
-                if polydata.GetNumberOfPoints() != len(distance_values):
-                    logger.error(f"  Mismatch in point count ({polydata.GetNumberOfPoints()}) and distance values ({len(distance_values)}) for {output_base_name}. Cannot create delta model.")
-                    failure_count +=1
-                    continue
-
-                vtk_distance_array = vtk.vtkDoubleArray() 
-                vtk_distance_array.SetName("DeltaValues") 
-                vtk_distance_array.SetNumberOfComponents(1)
-                for val in distance_values: # More robust way to add tuples
-                    vtk_distance_array.InsertNextTuple1(val)
-                
-                polydata.GetPointData().AddArray(vtk_distance_array) 
-                polydata.GetPointData().SetActiveScalars("DeltaValues")
-                
-                writer = vtk.vtkPolyDataWriter()
-                writer.SetFileName(final_delta_vtk_path)
-                writer.SetInputData(polydata)
-                writer.SetFileVersion(42) 
-                writer.Write()
-                logger.info(f"  Successfully generated delta model: {final_delta_vtk_path}")
-                success_count += 1
-
-            except Exception as e_vtk:
-                logger.error(f"  Error generating VTK delta model for {output_base_name}: {e_vtk}")
-                logger.exception("Detailed traceback for VTK delta model generation error:")
-                failure_count += 1
-        
-        logger.info(f"Delta model generation finished. Success: {success_count}, Failures: {failure_count}")
-        return failure_count == 0 
-
-    except Exception as e_main:
-        logger.error(f"Error processing M2MD results summary CSV for delta model generation: {e_main}")
-        logger.exception("Detailed traceback for delta model generation error:")
-        return False
+                dists = pd.read_csv(scalars_csv, header=None).values.astype(float).flatten()
+                reader = vtk.vtkPolyDataReader(); reader.SetFileName(base_vtk); reader.Update(); pdata = reader.GetOutput()
+                if not pdata or pdata.GetNumberOfPoints()==0: logger.error(f"  Bad base VTK: {base_vtk}"); continue
+                if pdata.GetNumberOfPoints()!=len(dists): logger.error(f"  Point mismatch for '{out_base}': VTK {pdata.GetNumberOfPoints()}, CSV {len(dists)}"); continue
+                vtk_s = vtk.vtkDoubleArray(); vtk_s.SetName("DeltaValues"); vtk_s.SetNumberOfComponents(1)
+                for v in dists: vtk_s.InsertNextTuple1(v)
+                pdata.GetPointData().AddArray(vtk_s); pdata.GetPointData().SetActiveScalars("DeltaValues")
+                writer = vtk.vtkPolyDataWriter(); writer.SetFileName(delta_vtk_file); writer.SetInputData(pdata); writer.SetFileVersion(42); writer.Write()
+                logger.info(f"  OK: {delta_vtk_file}"); s_count +=1
+            except Exception as e_v: logger.error(f"  ERR delta gen for '{out_base}': {e_v}"); logger.exception("  Traceback:")
+        logger.info(f"Delta model gen done. Processed: {a_count}, Successful: {s_count}.")
+        return s_count == (df_results[df_results['Status']=='Completed'].shape[0])
+    except Exception as e_sum: logger.error(f"ERR proc M2MD summary {m2md_results_summary_csv}: {e_sum}"); logger.exception("Traceback:"); return False

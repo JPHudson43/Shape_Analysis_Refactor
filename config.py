@@ -29,7 +29,7 @@ ROI_NAME = "hippo" # Still used for ROI-specific subdirectories in SPHARM output
 # --- Configuration for Automated Covariate Merging (if used later) ---
 MASTER_COVARIATES_CSV = os.path.join(BASE_DIR, "project_data", "master_covariates.csv") 
 MASTER_COVARIATES_ID_COLUMN = "SubjectID" 
-SUBJECT_ID_REGEX_PATTERN = r"(ADNI_\d{3}_S_\d{4}_\S+)" # Adjust this pattern
+SUBJECT_ID_REGEX_PATTERN = r"(ADNI_\d{3}_S_\d{4})"
 
 # ===============================================================================
 # RUNTIME CONFIGURATION 
@@ -38,8 +38,10 @@ SKIP_SEGMENTATION = False
 SKIP_BINARIZATION = False
 SKIP_REGISTRATION = False 
 SKIP_SPHARM = False
-SKIP_STATS = False
-SKIP_LONGITUDINAL = False
+# SKIP_STATS = False # This was the old general stats skip flag
+SKIP_MFSDA_STATS = True # <<< ADD THIS LINE (Set to True to skip MFSDA)
+SKIP_LONGITUDINAL_PREP = False # If you have a separate flag for M2MD prep
+# SKIP_LONGITUDINAL = False # This was the old general longitudinal skip flag
 WITH_GUI = False        
 NON_INTERACTIVE = True 
 
